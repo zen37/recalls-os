@@ -100,67 +100,64 @@ No Postgres, no Vault, no Prometheus/Grafana — those appear only in the produc
 
 ---
 
+Added the caveat. Here is the full §4 as it now reads:
+
+---
+
 ## 4. Extraction layer
 
-This is where most of the engineering lives. Every connector handles the same API realities behind a common interface (§4.1). (If you later adopt Airbyte for catalog sources, it sits alongside these — but it is not the default.)
+Most of the engineering lives here. Every connector implements one small interface (§4.1) and handles the same API realities the same way — auth, rate limits, incremental pulls, pagination, schema drift. The rest of this section is that checklist.
 
 ### 4.1 Connector interface
 
-A custom connector implements a small contract so orchestration treats all sources uniformly:
+One contract, so orchestration treats every source the same:
 
 ```python
 class Connector(Protocol):
-    def discover(self) -> list[Stream]: ...          # entities available
+    def discover(self) -> list[Stream]: ...          # what entities exist
     def read(self, stream: Stream, state: State) -> Iterator[RawRecord]: ...
-    # yields raw payload records + emits new cursor/state as it goes
+    # yields raw records + emits the new cursor as it goes
 ```
 
 `state` carries the incremental cursor (§4.4). `read` yields the payload **untouched** — no typing, no reshaping.
 
-### 4.2 Authentication & secrets
+> **PoC:** don't over-formalize. A plain function per source is fine at 1–2 sources — extract this interface once you have a few and can see what's genuinely common. The value of the contract is uniformity across *many* sources, which is a production concern.
 
-- API keys, OAuth client secrets, and refresh tokens live in **Vault**, never in config or code.
-- A shared auth helper handles **OAuth2 token refresh** (refresh-ahead of expiry) and injects credentials at request time.
-- Rotation is centralized: rotate in Vault, no connector redeploy.
+### 4.2 Authentication
+
+Keys, OAuth secrets, and refresh tokens live in **Vault** — never in code. A shared helper refreshes OAuth tokens ahead of expiry and injects them per request. Rotate in Vault; no connector redeploy.
 
 ### 4.3 Rate limiting & retries
 
-- **Per-source token-bucket limiter** so you stay under each API's quota regardless of worker count.
-- Respect `Retry-After` and `X-RateLimit-*` headers when present.
-- **Exponential backoff with jitter** on 429/5xx; cap attempts, then dead-letter the batch (§6).
-- Retry only idempotent (GET) requests automatically; never blindly retry non-idempotent calls.
+One **token-bucket limiter per source** keeps you under the API's quota. Respect `Retry-After` / `X-RateLimit-*` headers. On 429/5xx, **back off exponentially with jitter**, cap attempts, then dead-letter the batch (§6). Auto-retry GETs only — never blind-retry non-idempotent calls.
 
-### 4.4 Incremental extraction (high-water mark)
+### 4.4 Incremental pulls (high-water mark)
 
-- Each stream tracks a **cursor** — `updated_at`, a monotonic sequence ID, or an opaque API cursor — persisted in Postgres per `(source, entity)`.
-- Pull only records newer than the stored cursor.
-- **Commit-after-land:** advance the cursor *only after* the batch is durably written to Landing. A crash mid-run re-pulls rather than skips → at-least-once into Landing.
-- **Full refresh** fallback when: the source has no reliable delta field, the cursor is lost/corrupt, or on a periodic reconciliation run (e.g. weekly) to catch silent updates/deletes.
-- Landing does **not** dedupe — overlapping re-pulls are expected and are resolved downstream (Bronze onward). Landing keeps everything.
+Each stream keeps a **cursor** (`updated_at`, a sequence ID, or an opaque API cursor) in Postgres per `(source, entity)`, and pulls only records newer than it.
+
+- **Commit-after-land:** advance the cursor *only after* the batch is written to Landing. A crash re-pulls instead of skipping → at-least-once.
+- **Full refresh** when the source has no reliable delta field, the cursor is lost, or on a periodic reconciliation run to catch silent updates/deletes.
+- Overlapping re-pulls are expected — Landing keeps everything and **does not dedupe** (that's downstream).
 
 ### 4.5 Concurrency & parallelism
 
-Parallelism happens at three levels, each with a different owner and constraint:
+Three levels, from safest to most constrained:
 
-1. **Across sources / entities** — independent Dagster assets run concurrently by default. This is the free, safe parallelism: Shopify and Stripe have separate quotas, so pulling them at once costs nothing. Bound by a global run-concurrency limit so you don't exhaust workers.
-2. **Within a source, across partitions** — a partitioned backfill (e.g. 90 days of history) can fan out many partition runs at once. Cap this with a **per-source concurrency limit** in Dagster so a big backfill doesn't blow the API quota.
-3. **Within a single pull — concurrent requests** — fetching multiple pages/records in parallel inside one connector run. This is the highest-throughput lever and the most constrained:
-   - **Only possible when pagination is partitionable.** If the API pages by an opaque `next_cursor` (each page derived from the previous response), fetching is **inherently sequential** — you can't request page N+1 until page N returns. Parallelize only when you can split the keyspace independently: date ranges, ID ranges, or a `total_count`/`last_page` that lets you compute page numbers up front.
-   - Use a bounded worker pool (e.g. `asyncio` + a semaphore), never unbounded fan-out.
+1. **Across sources** — separate Dagster assets run at once. Free and safe (separate quotas); cap with a global run limit.
+2. **Across partitions of one source** — a backfill fans out many partitions; cap with a **per-source limit** so it doesn't blow the quota.
+3. **Within one pull** — concurrent page requests. Highest throughput, most limited: only works if you can **split the keyspace** (date/ID ranges, or a known page count). Opaque `next_cursor` paging is **sequential** — page N+1 needs page N first. Use a bounded pool (`asyncio` + semaphore).
 
-**Everything sits under the per-source rate limiter (§4.3).** The token bucket is the single global throttle for a source; parallel workers *share* one limiter rather than each holding their own. Otherwise parallelism just spends your quota faster and trips 429s. Net effect: concurrency raises throughput only up to the rate limit — past that, add workers buys nothing and you're bound by the quota, not by CPU.
+All of it **shares the one per-source rate limiter** (§4.3) — parallel workers don't each get their own. So concurrency only helps up to the quota; past that you're quota-bound, not CPU-bound, and more workers just trip 429s.
 
-Ordering caveat: parallel fetching can land records out of order. That's fine here — Landing is append-only and unordered by design (§5); the cursor still advances by the max watermark observed, and dedupe/ordering are downstream concerns.
+Parallel fetches can land out of order — fine here: Landing is append-only and unordered (§5), the cursor advances by the max watermark seen, and ordering is a downstream concern.
 
 ### 4.6 Pagination
 
-Abstract the three common shapes behind the connector so orchestration never sees them: cursor/token-based, offset/limit, and `Link`-header (RFC 5988). The connector yields pages; the framework yields records.
+Hide the shape inside the connector so nothing upstream cares: cursor/token, offset/limit, or `Link`-header (RFC 5988). The connector walks pages; it yields records.
 
 ### 4.7 Schema drift
 
-- APIs add and rename fields silently. **Do not impose a schema at extract time.** Land the payload as JSON exactly as received.
-- Detect drift by diffing observed keys against the last-seen key set; **log/alert on change rather than failing the pull** — Landing must keep accepting data.
-- Schema enforcement is a downstream (Bronze) concern, not Landing's.
+APIs add and rename fields silently, so **don't impose a schema at extract time** — land the JSON exactly as received. Detect drift by diffing keys against the last-seen set and **alert instead of failing** — Landing must keep accepting data. Enforcing schema is a downstream (Bronze) job.
 
 ---
 
