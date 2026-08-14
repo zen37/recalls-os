@@ -63,18 +63,19 @@ The pipeline in scope is exactly two moves: **extract → land raw.** Nothing re
         │ raw JSON (as-is, untouched)
         ▼
  ┌───────────────────────────────────────────┐
- │ LANDING zone — MinIO / Iceberg             │   immutable, append-only,
- │ landing.<source>.<entity>                  │   partitioned by
- └───────────────────────────────────────────┘   source + ingest_date
+ │ LANDING — raw response files (immutable)   │   storage: MinIO/S3
+ │ <source>/<entity>/<ingest_date>/*.json.gz  │   format: NDJSON/JSON, gzipped
+ │ (append-only, no schema, no table format)  │   byte-for-byte as returned
+ └───────────────────────────────────────────┘
                      │
-                     ▼  (out of scope) → Bronze → Silver → Gold
+                     ▼  (out of scope) → Bronze (raw → Iceberg table) → Silver → Gold
 ```
 
 Two stages only: **extract** (connectors) and **land** (Landing zone). Downstream layers consume Landing but are not part of this design.
 
 ### 3.2 PoC
 
-Same two stages and the same core path — the supporting services collapse to their local stand-ins (cursor → SQLite/JSON file, secrets → `.env`, metrics → stdout logs). Dagster and Iceberg stay, because the PoC must demonstrate real orchestration and the real table format.
+Same two stages and the same core path — the supporting services collapse to their local stand-ins (cursor → SQLite/JSON file, secrets → `.env`, metrics → stdout logs). Dagster stays, because the PoC must demonstrate real orchestration; Landing is just raw files on disk.
 
 ```
                         ┌───────────────────────────────────────────┐
@@ -91,16 +92,13 @@ Same two stages and the same core path — the supporting services collapse to t
         │ raw JSON (as-is)
         ▼
  ┌───────────────────────────────────────────┐
- │ LANDING — local Iceberg tables             │   PyIceberg + SQLite catalog,
- │ landing.<source>.<entity>                  │   Parquet on local disk (or
- └───────────────────────────────────────────┘   one MinIO container)
+ │ LANDING — raw response files (immutable)   │   storage: local disk (or 1 MinIO)
+ │ <source>/<entity>/<ingest_date>/*.json.gz  │   format: NDJSON/JSON, gzipped
+ │ (append-only, no schema, no table format)  │   byte-for-byte as returned
+ └───────────────────────────────────────────┘
 ```
 
-No Postgres, no Vault, no Prometheus/Grafana — those appear only in the production diagram (§3.1). Everything you build in the PoC carries forward; going to prod swaps the *backends* (file→Postgres, `.env`→Vault, stdout→Prometheus), not the design.
-
----
-
-Added the caveat. Here is the full §4 as it now reads:
+No Postgres, no Vault, no Prometheus/Grafana — those appear only in the production diagram (§3.1). Everything you build in the PoC carries forward; going to prod swaps the *backends* (local disk→MinIO/S3, file→Postgres, `.env`→Vault, stdout→Prometheus), not the design.
 
 ---
 
