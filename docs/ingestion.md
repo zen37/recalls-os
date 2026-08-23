@@ -27,9 +27,9 @@ The pipeline in scope is exactly two moves: **extract → land raw.** Nothing re
 
 | Concern | Production choice | Why this one | PoC — start here |
 |---|---|---|---|
-| Extraction / connectors | **Custom Python connectors** implementing the §4.1 interface | Uniform control over auth, pagination, incremental, and raw-as-is landing into *our* Iceberg tables — one paradigm, no second platform to run. *Optional accelerator:* **Airbyte (OSS)** only if many sources are already in its catalog and you'd rather not maintain that connector code (accepting its heavier deployment and opinionated landing). | **Required.** Custom Python scripts for the 1–2 sources you're proving. No Airbyte — it's pure overhead at PoC scale. |
-| Landing store | **MinIO** (S3-compatible object storage) | Cheap, immutable raw zone; S3 API means zero rewrite if you move to real S3/GCS. | **Required**, but local filesystem or a single MinIO container is plenty. |
-| Landing file layout | **Apache Iceberg** (append-only tables) | ACID appends, schema evolution, time travel; downstream engines read it directly. | **Use Iceberg here too — it runs fully local, no cloud.** PyIceberg + a **SQLite catalog** writing Parquet to a local dir (or a single MinIO container) gives you the real table format in the PoC. Same tables/behavior you take to production; you just swap the catalog and object store later. |
+| Extraction / connectors | **Lightweight custom Python connectors** (`httpx` + a paginator + cursor) implementing the §4.1 interface | Full control over auth, pagination, incremental, and writing raw-as-is files to Landing — one paradigm, no second platform to run. Deliberately *not* a normalizing framework: **dlt** infers schema and produces typed tables, which is the Landing → Bronze hop, not raw Landing (see §5). **Airbyte** is likewise a heavier catalog tool for later; neither is used to land raw. | **Required.** Custom Python scripts for the 1–2 sources you're proving. No dlt, no Airbyte — both do more than raw landing needs at PoC scale. |
+| Landing store | **MinIO** (S3-compatible object storage) | Cheap, immutable raw zone; S3 API means zero rewrite if you move to real S3/GCS. | **Required**, but the local filesystem or a single MinIO container is plenty. |
+| Landing format | **Raw response files** — NDJSON/JSON, gzipped, one object per fetched batch | Landing stays truly raw: byte-for-byte what the API returned, no schema, no table format. Max fidelity, trivially replayable. (Turning these into an Iceberg table is the **Bronze** hop — out of scope, §5.) | **Same — raw files on disk.** Write `.json.gz` under `source/entity/ingest_date/`. Nothing to set up. |
 | Orchestration | **Dagster** | Asset-based model fits "each source partition is a landed asset"; retries, backfills, scheduling. | **Required.** Run `dagster dev` on one node — the PoC must demonstrate real orchestration (scheduling, retries, backfills), not a cron placeholder. Only full multi-node deployment can wait. |
 | Concurrency / parallelism | **Dagster concurrency limits** (across sources + per-source partition cap) + **`asyncio` bounded worker pool** for concurrent requests, all under the per-source **rate limiter** (§4.3, §4.5) | Three levels of parallelism with one shared throttle so throughput is bound by API quota, not workers; opaque-cursor pagination stays sequential. | **Demonstrate it.** Same mechanisms, small numbers: run 2 sources concurrently, cap partition backfill fan-out, and use an async pool with a semaphore for a partitionable source. Proves the model without production tuning. |
 | Metadata / state store | **PostgreSQL** | Cursors / high-water marks, run metadata, connector config. | **Deferrable.** Cursor in a SQLite/JSON file (or full-refresh, no cursor); config in YAML; run history from Dagster. Add Postgres when you have concurrent workers or many sources. |
@@ -37,7 +37,7 @@ The pipeline in scope is exactly two moves: **extract → land raw.** Nothing re
 | Observability | **Prometheus + Grafana**, structured logs to **Loki** | Freshness, rows landed, error/retry rate, rate-limit hits. | **Deferrable.** Structured logs to stdout are enough to prove it works. |
 | Packaging / runtime | **Docker** + **Kubernetes** (or Docker Compose for a single node) | Reproducible connector runtimes, isolated per-source resources. | **Optional.** Run locally or in one Docker Compose file; K8s only at scale. |
 
-> **PoC in one line:** custom Python connector → SQLite/JSON cursor → **local Iceberg tables (PyIceberg + SQLite catalog, Parquet on local disk or MinIO)**, **orchestrated by Dagster (`dagster dev`)** so the PoC shows real scheduling, retries, and backfills. Secrets in `.env`, logs to stdout. That proves extract → land *with proper orchestration* end to end. Everything else in the "Production choice" column is what you graduate to under real concurrency, volume, and multi-source load.
+> **PoC in one line:** custom Python connector → SQLite/JSON cursor → **raw `.json.gz` files on local disk (or one MinIO container)**, **orchestrated by Dagster (`dagster dev`)** so the PoC shows real scheduling, retries, and backfills. Secrets in `.env`, logs to stdout. That proves extract → land *with proper orchestration* end to end. Everything else in the "Production choice" column is what you graduate to under real concurrency, volume, and multi-source load.
 >
 > Lighter production footprint (between PoC and full): Docker Compose + MinIO + Dagster + Postgres on one box, Vault→SOPS. Same architecture, smaller blast radius.
 
@@ -159,31 +159,43 @@ APIs add and rename fields silently, so **don't impose a schema at extract time*
 
 ---
 
-## 5. Landing zone (raw, immutable)
+## 5. Landing zone (raw files, immutable)
 
-- Write untransformed responses to **MinIO** as **Iceberg** tables `landing.<source>.<entity>`, **append-only**.
-- Partition by `source` + `ingest_date`. One row per API record: the full JSON payload plus ingest metadata.
+Landing is a **pure raw file drop** — byte-for-byte what the API returned, with **no schema, no table format, no per-record parsing beyond what's needed to write it out.** This is the strictest definition of raw and keeps maximum fidelity for replay.
+
+**Layout.** One object per fetched batch, keyed by source, entity, and ingest date:
 
 ```
-_ingested_at        timestamp   -- when we fetched it
-_source             string
-_entity             string
-_source_cursor      string      -- cursor value at fetch
-_request_params     json        -- how we asked (for replay/audit)
-_batch_id           string      -- Dagster run / partition key
-_response_hash      string      -- optional: payload hash for downstream dedupe
-payload             json        -- raw response record, untouched
+s3://landing/<source>/<entity>/ingest_date=2026-08-14/
+    <batch_id>.json.gz          -- the raw response body/records, gzipped (NDJSON or JSON)
+    <batch_id>.meta.json        -- sidecar: fetch context (see below)
 ```
 
-- Landing is the **replay buffer and audit trail**. Any downstream layer rebuilds from here — no re-hitting the API.
+**Sidecar metadata** travels next to each batch (not mixed into the payload), so the raw file stays untouched:
+
+```
+{
+  "ingested_at":   "2026-08-14T09:15:03Z",   // when we fetched it
+  "source":        "shopify",
+  "entity":        "orders",
+  "source_cursor": "2026-08-14T09:14:58Z",    // cursor value at fetch
+  "request_params": { "...": "..." },          // how we asked (replay/audit)
+  "batch_id":      "run-8f3c-part-2026-08-14", // Dagster run / partition key
+  "record_count":  480,
+  "response_sha256": "…"                       // integrity / optional dedupe hint
+}
+```
+
+- Landing is the **replay buffer and audit trail**. Every downstream layer (starting with Bronze) is rebuilt from these files — no re-hitting the API.
 - Cheap object storage is the point: retain Landing effectively forever (or a long TTL) so reprocessing is always possible.
-- **Immutability:** Landing is append-only. No updates, no deletes (except TTL/compaction). Corrections happen downstream, never by mutating raw.
+- **Immutability:** append-only. No updates, no deletes (except TTL). Never mutate a landed file — corrections happen downstream.
+- **What Landing is *not*:** it is not a queryable table. Making these files into an Iceberg table (parsing records into rows/columns, typing, dedupe) is the **Landing → Bronze** hop — deliberately out of scope here. **This is where a tool like [dlt](https://dlthub.com) fits:** its schema inference + normalization + typed load is exactly Bronze, reading from these raw files. It is intentionally *not* used to land raw, because normalizing would defeat the strict raw zone.
 
 ---
 
 ## 6. Error handling & recovery
 
-- **Dead-letter** batches that fail to fetch/write or exhaust retries to `landing.<source>._dead_letter`, with the error context and (where available) the partial payload — never drop silently.
+- **Dead-letter** batches that fail to fetch/write or exhaust retries to a parallel path `landing/_dead_letter/<source>/<entity>/…`, with the error context and (where available) the partial payload — never drop silently.
 - **Isolated failures:** one source failing does not block others (independent Dagster assets).
 - **Backfills:** Dagster partitioned assets rematerialize any historical window by re-running partitions. Because Landing is append-only and cursors commit-after-land, backfills are safe and repeatable.
 
@@ -192,7 +204,7 @@ payload             json        -- raw response record, untouched
 ## 7. Orchestration, scheduling & observability
 
 - **Dagster** models each `(source, entity, partition)` as an asset with typed inputs (cursor) and outputs (landed partition), retries with backoff, and per-source schedules (e.g. every 15 min for hot sources, hourly/daily for cold ones).
-- **Metrics** (Prometheus → Grafana): freshness (time since last successful land per source), rows landed per run, error/retry rate, rate-limit hits, dead-letter volume.
+- **Metrics** (Prometheus → Grafana): freshness (time since last successful land per source), records/files landed per run, error/retry rate, rate-limit hits, dead-letter volume.
 - **Freshness SLA alerts** per source; page on stale sources and repeated failures; warn on schema drift and volume anomalies.
 - Note: content quality checks (nulls, uniqueness, types) belong to Bronze, not Landing. Landing only asserts *delivery* health — did we land, on time, without errors.
 
